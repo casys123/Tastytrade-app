@@ -48,10 +48,13 @@ TT_REDIRECT_URI = st.secrets.get("TT_REDIRECT_URI", os.getenv("TT_REDIRECT_URI",
 env = st.sidebar.radio("Environment", ["Sandbox (cert)", "Production"], index=0)
 if env.startswith("Sandbox"):
     BASE_URL = "https://api.cert.tastyworks.com"
-    AUTH_URL = "https://cert-my.staging-tasty.works/auth.html"
+    AUTH_URL = "https://cert.tastyworks.com/oauth/authorize"
+    OPTION_CHAIN_BASE = "https://api.cert.tastyworks.com"
 else:
     BASE_URL = "https://api.tastyworks.com"
-    AUTH_URL = "https://my.tastytrade.com/auth.html"
+    AUTH_URL = "https://api.tastyworks.com/oauth/authorize"
+    OPTION_CHAIN_BASE = "https://api.tastyworks.com"
+    
 TOKEN_URL = f"{BASE_URL}/oauth/token"
 
 # Session state for OAuth and preferences
@@ -159,6 +162,7 @@ def refresh_access_token() -> bool:
     payload = {
         "grant_type": "refresh_token",
         "refresh_token": rtok,
+        "client_id": TT_CLIENT_ID,
         "client_secret": TT_CLIENT_SECRET
     }
     
@@ -234,7 +238,7 @@ params = {
     "client_id": TT_CLIENT_ID,
     "redirect_uri": TT_REDIRECT_URI,
     "response_type": "code",
-    "scope": "read openid",   # read-only
+    "scope": "read:trade",   # Updated scope
     "state": "pcs_preview_only"
 }
 auth_link = AUTH_URL + "?" + urlparse.urlencode(params, doseq=True)
@@ -262,7 +266,12 @@ if st.button("Exchange Code for Tokens", disabled=not auth_code or not (TT_CLIEN
             "redirect_uri": TT_REDIRECT_URI
         }
         
-        response = make_request_with_retry("POST", TOKEN_URL, json_data=data)
+        headers = set_user_agent({
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        })
+        
+        response = make_request_with_retry("POST", TOKEN_URL, json_data=data, headers=headers)
         if response and response.status_code == 200:
             save_tokens(response.json())
             st.success("Access token obtained. You're connected.")
@@ -320,7 +329,8 @@ st.caption("Note: This app **never** submits orders. It only analyzes and genera
 # ===============================
 def fetch_option_chain(symbol: str) -> Optional[Dict[str, Any]]:
     """Fetch option chain data for a symbol."""
-    endpoint = f"{BASE_URL}/option-chains/compact/{symbol}" if use_compact_chain else f"{BASE_URL}/option-chains/{symbol}"
+    # Updated endpoint URL
+    endpoint = f"{OPTION_CHAIN_BASE}/option-chains/{symbol}/nested"
     
     response = make_request_with_retry("GET", endpoint, headers=auth_header())
     if response and response.status_code == 200:
@@ -333,39 +343,46 @@ def fetch_option_chain(symbol: str) -> Optional[Dict[str, Any]]:
 def parse_puts_from_chain(chain: Dict[str, Any]) -> pd.DataFrame:
     """Parse put options from chain data."""
     items = []
-    underlying_price = chain.get("underlying-price") or chain.get("underlying_price")
     
-    if "items" in chain:
-        # Compact chain format
-        for it in chain["items"]:
-            if (it.get("option-type") or it.get("option_type")) != "P":
-                continue
-                
-            bid = it.get("bid"); ask = it.get("ask")
-            mid = None
-            if bid is not None and ask is not None:
-                try: 
-                    mid = (float(bid) + float(ask)) / 2.0
-                except (ValueError, TypeError): 
-                    pass
-                    
-            items.append({
-                "symbol": it.get("symbol"),
-                "expiration": it.get("expiration-date") or it.get("expiration_date"),
-                "strike": float(it.get("strike-price") or it.get("strike_price")),
-                "bid": float(bid) if bid is not None else None,
-                "ask": float(ask) if ask is not None else None,
-                "mid": mid,
-                "iv": (it.get("implied-volatility") or it.get("implied_volatility") or None),
-                "delta": (it.get("delta") or None),
-                "underlying_price": underlying_price
-            })
+    # Extract underlying price
+    underlying_price = chain.get("underlying-price") or chain.get("underlying_price")
+    if not underlying_price:
+        # Try to get from quotes if not in chain
+        underlying_price = fetch_underlying_price(chain.get("symbol", ""))
+    
+    if "option-chain" in chain and "expirations" in chain["option-chain"]:
+        # New API format
+        for exp in chain["option-chain"]["expirations"]:
+            exp_date = exp.get("expiration-date") or exp.get("expiration_date")
+            for strike_data in exp.get("strikes", []):
+                for option in strike_data.get("options", []):
+                    if option.get("option-type") == "put":
+                        bid = option.get("bid")
+                        ask = option.get("ask")
+                        mid = None
+                        if bid is not None and ask is not None:
+                            try: 
+                                mid = (float(bid) + float(ask)) / 2.0
+                            except (ValueError, TypeError): 
+                                pass
+                                
+                        items.append({
+                            "symbol": option.get("symbol"),
+                            "expiration": exp_date,
+                            "strike": float(strike_data.get("strike-price") or strike_data.get("strike_price")),
+                            "bid": float(bid) if bid is not None else None,
+                            "ask": float(ask) if ask is not None else None,
+                            "mid": mid,
+                            "iv": option.get("implied-volatility") or option.get("implied_volatility"),
+                            "delta": option.get("delta"),
+                            "underlying_price": underlying_price
+                        })
     else:
-        # Full chain format
+        # Fallback to old format parsing
         for exp in chain.get("expirations", []):
             exp_date = exp.get("expiration-date") or exp.get("expiration_date")
             for s in exp.get("strikes", []):
-                if (s.get("option-type") or s.get("option_type")) != "P":
+                if (s.get("option-type") or s.get("option_type")) != "put":
                     continue
                     
                 bid = s.get("bid"); ask = s.get("ask")
@@ -434,36 +451,28 @@ def fetch_underlying_price(symbol: str) -> Optional[float]:
         
     headers = auth_header()
 
-    # 1) market-data/quotes (batch)
+    # Try the quotes endpoint
     try:
-        url = f"{BASE_URL}/market-data/quotes"
-        response = make_request_with_retry("GET", url, headers=headers, params={"symbols": symbol})
-        if response and response.status_code == 200:
-            px = _extract_price_from_quote_payload(response.json())
-            if px is not None:
-                return px
-    except Exception:
-        pass
-
-    # 2) market-data/quotes/{symbol}
-    try:
-        url = f"{BASE_URL}/market-data/quotes/{symbol}"
+        url = f"{BASE_URL}/quotes/{symbol}"
         response = make_request_with_retry("GET", url, headers=headers)
         if response and response.status_code == 200:
-            px = _extract_price_from_quote_payload(response.json())
-            if px is not None:
-                return px
+            data = response.json()
+            # Try to extract price from different possible response formats
+            if "data" in data and "last" in data["data"]:
+                return float(data["data"]["last"])
+            elif "last" in data:
+                return float(data["last"])
     except Exception:
         pass
 
-    # 3) fallback: market-metrics
+    # Try market-metrics as fallback
     try:
         url = f"{BASE_URL}/market-metrics/{symbol}"
         response = make_request_with_retry("GET", url, headers=headers)
         if response and response.status_code == 200:
-            px = _extract_price_from_quote_payload(response.json())
-            if px is not None:
-                return px
+            data = response.json()
+            if "data" in data and "last" in data["data"]:
+                return float(data["data"]["last"])
     except Exception:
         pass
 
@@ -511,8 +520,10 @@ if run_scan:
                 u_price = fetch_underlying_price(sym)
                 
             if u_price is None:
-                st.warning(f"{sym}: could not determine underlying price. Skipping.")
-                continue
+                st.warning(f"{sym}: could not determine underlying price. Please enter manually.")
+                u_price = st.number_input(f"{sym} underlying price", min_value=0.01, step=0.01, value=100.00, key=f"px_{sym}")
+                if not u_price:
+                    continue
 
             today = pd.Timestamp.utcnow().normalize()
             df_puts["DTE"] = (df_puts["expiration"] - today).dt.days
@@ -550,10 +561,11 @@ if run_scan:
 
                 # Filter by bid-ask spread
                 cand_short = cand_short[cand_short["bid"].notna() & cand_short["ask"].notna()].copy()
-                cand_short["bid_ask_spread_pct"] = (
-                    (cand_short["ask"] - cand_short["bid"]) / cand_short["mid"] * 100
-                )
-                cand_short = cand_short[cand_short["bid_ask_spread_pct"] <= max_bid_ask_spread].copy()
+                if not cand_short.empty and "mid" in cand_short.columns:
+                    cand_short["bid_ask_spread_pct"] = (
+                        (cand_short["ask"] - cand_short["bid"]) / cand_short["mid"] * 100
+                    )
+                    cand_short = cand_short[cand_short["bid_ask_spread_pct"] <= max_bid_ask_spread].copy()
                 
                 if cand_short.empty:
                     continue
@@ -620,7 +632,7 @@ if run_scan:
                         loss_prob = round(100.0 - pop, 2) if pop is not None else None
 
                         rr_txt = f"{credit:.2f} : {max_loss:.2f}"
-                        link = f"https://my.tastytrade.com/trade/{sym}/options" if not AUTH_URL.endswith("auth.html") else f"https://my.tastytrade.com/symbols/{sym}"
+                        link = f"https://my.tastytrade.com/trade/{sym}/options"
 
                         results_rows.append({
                             "Symbol": sym,
