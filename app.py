@@ -67,6 +67,10 @@ if "oauth" not in st.session_state:
 # Initialize scan results in session state
 if "scan_results" not in st.session_state:
     st.session_state.scan_results = []
+    
+# Track authorization status
+if "authorized" not in st.session_state:
+    st.session_state.authorized = False
 
 # ===============================
 # Utility Functions
@@ -139,6 +143,7 @@ def save_tokens(token_resp: Dict[str, Any]):
     st.session_state["oauth"]["token_type"] = token_resp.get("token_type", "Bearer")
     exp_in = int(token_resp.get("expires_in", 900))
     st.session_state["oauth"]["expires_at"] = int(time.time()) + exp_in - 15
+    st.session_state.authorized = True
 
 def token_expired() -> bool:
     """Check if the access token has expired."""
@@ -264,6 +269,12 @@ if st.button("Exchange Code for Tokens", disabled=not auth_code or not (TT_CLIEN
         else:
             error_msg = response.text if response else "No response received"
             st.error(f"Token exchange failed: {error_msg}")
+
+# Display authorization status
+if st.session_state.authorized:
+    st.success("✅ You are authorized and connected to Tastytrade")
+else:
+    st.info("🔒 Please authorize with Tastytrade to use the scanner")
 
 # ===============================
 # 2) Scanner controls
@@ -466,8 +477,8 @@ st.subheader("3) Run Scan")
 run_scan = st.button("Run scan (data-only)")
 
 if run_scan:
-    if not ensure_token():
-        st.error("Please authorize first.")
+    if not st.session_state.authorized:
+        st.error("Please authorize first by completing step 1.")
     else:
         all_syms = [s.strip() for s in symbols.split(",") if s.strip()]
         if not all_syms:
